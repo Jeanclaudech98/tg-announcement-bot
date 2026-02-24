@@ -7,8 +7,8 @@ A simple, robust Telegram bot to manage scheduled announcements in channels. It 
 - **Inline Buttons**: Easily attach inline URL buttons below the message.
 - **Scheduling**: Schedule posts to go out at exact future dates/times.
 - **Immediate Broadcasting**: Broadcast instantly to the channel.
-- **Persistence**: Survives bot restarts; scheduled jobs are saved in `jobs.json`.
-- **Security**: Hardcoded to only listen and respond to the specified `ADMIN_ID`.
+- **Persistence**: Survives bot restarts; scheduled jobs are saved in `jobs.db` (SQLite).
+- **Security**: Only listens and responds to IDs listed in `ADMIN_IDS`.
 
 ## Installation
 
@@ -16,7 +16,7 @@ A simple, robust Telegram bot to manage scheduled announcements in channels. It 
 2. Run `npm install` to install dependencies.
 3. Copy `.env.example` to `.env` and fill in your details:
    - `BOT_TOKEN`: Your Telegram Bot API token (from @BotFather).
-   - `ADMIN_ID`: Your personal Telegram User ID (get it from @userinfobot).
+   - `ADMIN_IDS`: Comma-separated Telegram User IDs allowed to manage the bot (e.g., `123456789,987654321`).
    - `CHANNEL_ID`: The target channel (e.g., `@MyChannel` or `-100123456789`). Ensure the bot is an admin in this channel!
 
 ## Usage

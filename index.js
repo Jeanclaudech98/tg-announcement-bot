@@ -2,22 +2,38 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const LocalSession = require('telegraf-session-local');
 const schedule = require('node-schedule');
-const fs = require('fs');
 const path = require('path');
+const Database = require('better-sqlite3');
 const { v4: uuidv4 } = require('uuid');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = Number.parseInt(process.env.ADMIN_ID, 10);
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+    .split(',')
+    .map((id) => Number.parseInt(id.trim(), 10))
+    .filter((id) => Number.isFinite(id));
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-if (!BOT_TOKEN || !Number.isFinite(ADMIN_ID) || !CHANNEL_ID) {
-    console.error('Missing or invalid BOT_TOKEN, ADMIN_ID, or CHANNEL_ID in environment.');
+if (!BOT_TOKEN || ADMIN_IDS.length === 0 || !CHANNEL_ID) {
+    console.error('Missing or invalid BOT_TOKEN, ADMIN_IDS, or CHANNEL_ID in environment.');
     process.exit(1);
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-const JOBS_FILE = path.join(__dirname, 'jobs.json');
+const ADMIN_ID_SET = new Set(ADMIN_IDS);
+const JOBS_DB_FILE = path.join(__dirname, 'jobs.db');
 const pendingMediaGroups = new Map();
+const db = new Database(JOBS_DB_FILE);
+
+db.exec(`
+    CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        date TEXT NOT NULL,
+        messageId INTEGER,
+        messageIds TEXT,
+        fromChatId TEXT NOT NULL,
+        reply_markup TEXT
+    )
+`);
 
 const getServerTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
 const formatInTimeZone = (date, timeZone) => new Intl.DateTimeFormat('en-US', {
@@ -37,18 +53,13 @@ const formatSchedulePreview = (date) => {
     return `UTC: ${formatInTimeZone(date, 'UTC')}\nServer (${serverTimeZone}): ${formatInTimeZone(date, serverTimeZone)}`;
 };
 
-// Ensure jobs file exists
-if (!fs.existsSync(JOBS_FILE)) {
-    fs.writeFileSync(JOBS_FILE, JSON.stringify([], null, 2));
-}
-
 // Session middleware for conversation state
 const localSession = new LocalSession({ database: 'sessions.json' });
 bot.use(localSession.middleware());
 
 // Restrict to admin
 bot.use((ctx, next) => {
-    if (ctx.from && ctx.from.id === ADMIN_ID) {
+    if (ctx.from && ADMIN_ID_SET.has(ctx.from.id)) {
         return next();
     } else if (ctx.chat && ctx.chat.type === 'private') {
         return ctx.reply('⛔ Unauthorized. You are not the admin.');
@@ -56,36 +67,50 @@ bot.use((ctx, next) => {
     return undefined;
 });
 
-const parseJobsFromDisk = () => {
+const parseJsonColumn = (jsonValue, fallbackValue) => {
+    if (!jsonValue) return fallbackValue;
     try {
-        const content = fs.readFileSync(JOBS_FILE, 'utf8');
-        const parsed = JSON.parse(content);
-        if (!Array.isArray(parsed)) {
-            throw new Error('jobs.json is not an array');
-        }
-        return parsed;
+        return JSON.parse(jsonValue);
     } catch (error) {
-        console.error('Failed to read jobs file, falling back to empty list:', error.message);
-        try {
-            const corruptedPath = `${JOBS_FILE}.corrupted.${Date.now()}`;
-            fs.copyFileSync(JOBS_FILE, corruptedPath);
-            console.error(`Backed up invalid jobs file to ${corruptedPath}`);
-        } catch (copyError) {
-            console.error('Could not back up invalid jobs file:', copyError.message);
-        }
-        return [];
+        return fallbackValue;
     }
 };
 
-const getJobs = () => parseJobsFromDisk();
+const mapJobRow = (row) => ({
+    id: row.id,
+    date: row.date,
+    messageId: row.messageId ?? undefined,
+    messageIds: parseJsonColumn(row.messageIds, undefined),
+    fromChatId: row.fromChatId,
+    reply_markup: parseJsonColumn(row.reply_markup, undefined)
+});
 
-const saveJobs = (jobs) => {
-    if (!Array.isArray(jobs)) {
-        throw new Error('saveJobs expected an array');
-    }
-    const tempPath = `${JOBS_FILE}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(jobs, null, 2));
-    fs.renameSync(tempPath, JOBS_FILE);
+const getJobsStmt = db.prepare(`
+    SELECT id, date, messageId, messageIds, fromChatId, reply_markup
+    FROM jobs
+    ORDER BY date ASC
+`);
+const insertJobStmt = db.prepare(`
+    INSERT INTO jobs (id, date, messageId, messageIds, fromChatId, reply_markup)
+    VALUES (@id, @date, @messageId, @messageIds, @fromChatId, @reply_markup)
+`);
+const deleteJobStmt = db.prepare('DELETE FROM jobs WHERE id = ?');
+const deletePastOrInvalidJobsStmt = db.prepare(`
+    DELETE FROM jobs
+    WHERE date <= @now OR date IS NULL OR fromChatId IS NULL OR id IS NULL
+`);
+
+const getJobs = () => getJobsStmt.all().map(mapJobRow);
+
+const saveJob = (job) => {
+    insertJobStmt.run({
+        id: job.id,
+        date: job.date,
+        messageId: job.messageId ?? null,
+        messageIds: job.messageIds ? JSON.stringify(job.messageIds) : null,
+        fromChatId: String(job.fromChatId),
+        reply_markup: job.reply_markup ? JSON.stringify(job.reply_markup) : null
+    });
 };
 
 const safeReply = async (ctx, text, extra = {}) => {
@@ -98,10 +123,12 @@ const safeReply = async (ctx, text, extra = {}) => {
 };
 
 const notifyAdmin = async (text) => {
-    try {
-        await bot.telegram.sendMessage(ADMIN_ID, text);
-    } catch (error) {
-        console.error('Failed to notify admin:', error.message);
+    for (const adminId of ADMIN_IDS) {
+        try {
+            await bot.telegram.sendMessage(adminId, text);
+        } catch (error) {
+            console.error(`Failed to notify admin ${adminId}:`, error.message);
+        }
     }
 };
 
@@ -230,30 +257,25 @@ const executeJob = async (job) => {
         await notifyAdmin(`❌ Failed to execute scheduled announcement (ID: \`${job.id}\`):\n${error.message}`);
         console.error(`Job ${job.id} failed:`, error.message);
     } finally {
-        // Remove from db after execution
-        let jobs = getJobs();
-        jobs = jobs.filter(j => j.id !== job.id);
-        saveJobs(jobs);
+        deleteJobStmt.run(job.id);
     }
 };
 
 const loadJobs = () => {
+    deletePastOrInvalidJobsStmt.run({ now: new Date().toISOString() });
     const jobs = getJobs();
     let loadedCount = 0;
-    const now = new Date();
 
-    // Filter out invalid and past jobs
-    const validJobs = jobs.filter(job => {
-        if (!job || !job.id || !job.date || !job.fromChatId) return false;
-        const date = new Date(job.date);
-        return !Number.isNaN(date.getTime()) && date > now;
-    });
-    if (validJobs.length !== jobs.length) {
-        saveJobs(validJobs);
-    }
-
-    validJobs.forEach(job => {
+    jobs.forEach(job => {
+        if (!job || !job.id || !job.date || !job.fromChatId) {
+            deleteJobStmt.run(job.id);
+            return;
+        }
         const jobDate = new Date(job.date);
+        if (Number.isNaN(jobDate.getTime()) || jobDate <= new Date()) {
+            deleteJobStmt.run(job.id);
+            return;
+        }
         const scheduled = schedule.scheduleJob(job.id, jobDate, () => executeJob(job));
         if (scheduled) {
             loadedCount++;
@@ -302,12 +324,8 @@ bot.command('deljob', (ctx) => {
     if (parts.length < 2) return safeReply(ctx, '⚠️ Provide an ID: `/deljob <ID>`');
 
     const id = parts[1];
-    let jobs = getJobs();
-    const initialLength = jobs.length;
-    jobs = jobs.filter(j => j.id !== id);
-
-    if (jobs.length < initialLength) {
-        saveJobs(jobs);
+    const deleted = deleteJobStmt.run(id);
+    if (deleted.changes > 0) {
         schedule.cancelJob(id);
         safeReply(ctx, `✅ Job \`${id}\` cancelled and deleted.`, { parse_mode: 'Markdown' });
     } else {
@@ -441,14 +459,16 @@ bot.on('message', async (ctx) => {
                 reply_markup: ctx.session.draft.reply_markup
             };
 
-            let jobs = getJobs();
-            jobs.push(job);
-            saveJobs(jobs);
+            try {
+                saveJob(job);
+            } catch (error) {
+                console.error('Failed to save job:', error.message);
+                return safeReply(ctx, '❌ Failed to save this job. Please try again.');
+            }
 
             const scheduled = schedule.scheduleJob(job.id, date, () => executeJob(job));
             if (!scheduled) {
-                jobs = jobs.filter((j) => j.id !== job.id);
-                saveJobs(jobs);
+                deleteJobStmt.run(job.id);
                 return safeReply(ctx, '❌ Failed to schedule this job. Please try again.');
             }
 
@@ -469,7 +489,7 @@ bot.on('message', async (ctx) => {
 bot.catch(async (err, ctx) => {
     console.error('Unhandled bot error:', err);
     await notifyAdmin(`❌ Unhandled bot error: ${err.message}`);
-    if (ctx && ctx.chat && ctx.chat.type === 'private' && ctx.from && ctx.from.id === ADMIN_ID) {
+    if (ctx && ctx.chat && ctx.chat.type === 'private' && ctx.from && ADMIN_ID_SET.has(ctx.from.id)) {
         await safeReply(ctx, '❌ Something went wrong while processing that update.');
     }
 });
