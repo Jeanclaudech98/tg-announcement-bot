@@ -23,6 +23,9 @@ const ADMIN_ID_SET = new Set(ADMIN_IDS);
 const JOBS_DB_FILE = path.join(__dirname, 'jobs.db');
 const pendingMediaGroups = new Map();
 const db = new Database(JOBS_DB_FILE);
+db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');
+db.pragma('busy_timeout = 5000');
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
@@ -99,6 +102,14 @@ const deletePastOrInvalidJobsStmt = db.prepare(`
     DELETE FROM jobs
     WHERE date <= @now OR date IS NULL OR fromChatId IS NULL OR id IS NULL
 `);
+const countJobsStmt = db.prepare('SELECT COUNT(*) AS count FROM jobs WHERE date > @now');
+const nextJobStmt = db.prepare(`
+    SELECT id, date
+    FROM jobs
+    WHERE date > @now
+    ORDER BY date ASC
+    LIMIT 1
+`);
 
 const getJobs = () => getJobsStmt.all().map(mapJobRow);
 
@@ -122,6 +133,30 @@ const safeReply = async (ctx, text, extra = {}) => {
     }
 };
 
+const clearPendingMediaGroupsForUser = (chatId, userId) => {
+    const prefix = `${chatId}:${userId}:`;
+    for (const [key, value] of pendingMediaGroups.entries()) {
+        if (!key.startsWith(prefix)) continue;
+        if (value.timer) clearTimeout(value.timer);
+        pendingMediaGroups.delete(key);
+    }
+};
+
+const hasPendingMediaGroupsForUser = (chatId, userId) => {
+    const prefix = `${chatId}:${userId}:`;
+    for (const key of pendingMediaGroups.keys()) {
+        if (key.startsWith(prefix)) return true;
+    }
+    return false;
+};
+
+const countPendingJobs = () => countJobsStmt.get({ now: new Date().toISOString() }).count;
+
+const getNextJob = () => {
+    const row = nextJobStmt.get({ now: new Date().toISOString() });
+    return row || null;
+};
+
 const notifyAdmin = async (text) => {
     for (const adminId of ADMIN_IDS) {
         try {
@@ -130,6 +165,16 @@ const notifyAdmin = async (text) => {
             console.error(`Failed to notify admin ${adminId}:`, error.message);
         }
     }
+};
+
+const formatDraftSummary = (draft) => {
+    const type = Array.isArray(draft.messageIds)
+        ? `media group (${draft.messageIds.length} items)`
+        : 'single message';
+    const hasButtons = draft.reply_markup && draft.reply_markup.inline_keyboard
+        ? draft.reply_markup.inline_keyboard.length
+        : 0;
+    return `Preview details:\n- Type: ${type}\n- Buttons: ${hasButtons}`;
 };
 
 const parseScheduleInput = (input) => {
@@ -213,25 +258,29 @@ const isSupportedSourceMessage = (message) => {
 };
 
 const copyAnnouncement = async (announcement) => {
+    return copyAnnouncementToChat(CHANNEL_ID, announcement);
+};
+
+const copyAnnouncementToChat = async (targetChatId, announcement) => {
     const messageIds = Array.isArray(announcement.messageIds) ? announcement.messageIds : null;
     const hasMediaGroup = messageIds && messageIds.length > 1;
 
     if (hasMediaGroup) {
         try {
             await bot.telegram.callApi('copyMessages', {
-                chat_id: CHANNEL_ID,
+                chat_id: targetChatId,
                 from_chat_id: announcement.fromChatId,
                 message_ids: messageIds
             });
         } catch (error) {
             console.error('copyMessages failed, falling back to per-message copy:', error.message);
             for (const id of messageIds) {
-                await bot.telegram.copyMessage(CHANNEL_ID, announcement.fromChatId, id);
+                await bot.telegram.copyMessage(targetChatId, announcement.fromChatId, id);
             }
         }
 
         if (announcement.reply_markup) {
-            await bot.telegram.sendMessage(CHANNEL_ID, 'Links:', {
+            await bot.telegram.sendMessage(targetChatId, 'Links:', {
                 reply_markup: announcement.reply_markup
             });
         }
@@ -243,7 +292,7 @@ const copyAnnouncement = async (announcement) => {
         throw new Error('Missing source message ID.');
     }
 
-    await bot.telegram.copyMessage(CHANNEL_ID, announcement.fromChatId, messageId, {
+    await bot.telegram.copyMessage(targetChatId, announcement.fromChatId, messageId, {
         reply_markup: announcement.reply_markup
     });
 };
@@ -268,7 +317,7 @@ const loadJobs = () => {
 
     jobs.forEach(job => {
         if (!job || !job.id || !job.date || !job.fromChatId) {
-            deleteJobStmt.run(job.id);
+            if (job && job.id) deleteJobStmt.run(job.id);
             return;
         }
         const jobDate = new Date(job.date);
@@ -287,21 +336,67 @@ const loadJobs = () => {
 };
 
 bot.command('start', (ctx) => {
+    if (ctx.chat && ctx.from) {
+        clearPendingMediaGroupsForUser(ctx.chat.id, ctx.from.id);
+    }
     ctx.session.step = null;
     ctx.session.draft = null;
-    safeReply(ctx, '👋 Welcome to the Announcement Bot.\n\nCommands:\n/new - Create a new announcement\n/jobs - View scheduled jobs\n/cancel - Cancel current operation');
+    safeReply(ctx, '👋 Welcome to the Announcement Bot.\n\nCommands:\n/new - Create a new announcement\n/jobs - View scheduled jobs\n/status - Bot status\n/preview - Preview current draft\n/cancel - Cancel current operation');
 });
 
 bot.command('cancel', (ctx) => {
+    if (ctx.chat && ctx.from) {
+        clearPendingMediaGroupsForUser(ctx.chat.id, ctx.from.id);
+    }
     ctx.session.step = null;
     ctx.session.draft = null;
     safeReply(ctx, '❌ Cancelled current operation.');
 });
 
 bot.command('new', (ctx) => {
+    if (ctx.chat && ctx.from) {
+        clearPendingMediaGroupsForUser(ctx.chat.id, ctx.from.id);
+    }
     ctx.session.step = 'awaiting_message';
     ctx.session.draft = {};
     safeReply(ctx, '1️⃣ Send me the message, photo, video, or document you want to announce.\n*(Formatting and media will be preserved exactly as you send it.)*', { parse_mode: 'Markdown' });
+});
+
+bot.command('preview', async (ctx) => {
+    const draft = ctx.session.draft;
+    if (!draft || !draft.fromChatId || (!draft.messageId && !draft.messageIds)) {
+        return safeReply(ctx, '📭 No draft to preview. Start with /new.');
+    }
+
+    try {
+        await safeReply(ctx, `👀 Draft preview\n${formatDraftSummary(draft)}`);
+        await copyAnnouncementToChat(ctx.chat.id, draft);
+    } catch (error) {
+        console.error('Preview failed:', error.message);
+        await safeReply(ctx, `❌ Failed to render preview: ${error.message}`);
+    }
+});
+
+bot.command('status', (ctx) => {
+    const now = new Date();
+    const serverTimeZone = getServerTimeZone();
+    const pendingCount = countPendingJobs();
+    const next = getNextJob();
+    const nextLine = next
+        ? `Next job: ${formatSchedulePreview(new Date(next.date))}\nNext job ID: \`${next.id}\``
+        : 'Next job: none';
+    const scheduledRuntime = Object.keys(schedule.scheduledJobs || {}).length;
+    const message = [
+        '🤖 *Bot status*',
+        `DB: \`${JOBS_DB_FILE}\``,
+        `Server timezone: \`${serverTimeZone}\``,
+        `Current UTC: \`${formatInTimeZone(now, 'UTC')}\``,
+        `Current server time: \`${formatInTimeZone(now, serverTimeZone)}\``,
+        `Pending jobs in DB: \`${pendingCount}\``,
+        `Jobs loaded in runtime scheduler: \`${scheduledRuntime}\``,
+        nextLine
+    ].join('\n');
+    safeReply(ctx, message, { parse_mode: 'Markdown' });
 });
 
 bot.command('jobs', (ctx) => {
@@ -340,6 +435,10 @@ bot.on('message', async (ctx) => {
     if (!step) return;
 
     if (step === 'awaiting_message') {
+        if (ctx.chat && ctx.from && hasPendingMediaGroupsForUser(ctx.chat.id, ctx.from.id) && !ctx.message.media_group_id) {
+            return safeReply(ctx, '⏳ Still collecting your media group. Please wait 1-2 seconds after the last media item.');
+        }
+
         if (!isSupportedSourceMessage(ctx.message)) {
             return safeReply(ctx, '⚠️ This message type cannot be copied by Telegram. Send text, photo, video, document, animation, audio, voice, video note, or sticker.');
         }
@@ -419,9 +518,17 @@ bot.on('message', async (ctx) => {
         ctx.session.draft.reply_markup = reply_markup;
         ctx.session.step = 'awaiting_schedule';
 
+        try {
+            await safeReply(ctx, `👀 Draft preview\n${formatDraftSummary(ctx.session.draft)}`);
+            await copyAnnouncementToChat(ctx.chat.id, ctx.session.draft);
+        } catch (error) {
+            console.error('Automatic preview failed:', error.message);
+            await safeReply(ctx, `⚠️ Preview failed: ${error.message}`);
+        }
+
         return safeReply(
             ctx,
-            '3️⃣ Almost done! When should I post this?\n\n- Type "now" to post immediately.\n- Send `YYYY-MM-DD HH:MM` (defaults to UTC).\n- Or include timezone explicitly: `YYYY-MM-DD HH:MM UTC` or `YYYY-MM-DD HH:MM -05:00`.',
+            '3️⃣ Almost done! When should I post this?\n\n- Type "now" to post immediately.\n- Send `YYYY-MM-DD HH:MM` (defaults to UTC).\n- Or include timezone explicitly: `YYYY-MM-DD HH:MM UTC` or `YYYY-MM-DD HH:MM -05:00`.\n- Use `/preview` anytime to re-check the draft.',
             { parse_mode: 'Markdown' }
         );
     }
